@@ -16,11 +16,11 @@
 
 This Adapater is for integrating todoist.
 It uses the REST API
-https://developer.todoist.com/rest/v1/#overview
+https://developer.todoist.com/api/v1/
 
 Dieser Adaber dient zur zur Integration von todoist.
 Er verwendet die Rest API
-https://developer.todoist.com/rest/v1/#overview
+https://developer.todoist.com/api/v1/
 
 ## Beschreibung
 

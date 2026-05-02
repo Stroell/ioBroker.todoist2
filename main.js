@@ -1,6 +1,6 @@
 /**
  Api erkärung:
- https://developer.todoist.com/rest/v2/
+ https://developer.todoist.com/api/v1/
  Das ist ein test!
 */
 
@@ -57,6 +57,68 @@ let timeoutsyncron = null;
 
 // intervall:
 let mainintval = null;
+
+
+/**
+ * Base URL of the Todoist API.
+ * The new unified Todoist API (https://developer.todoist.com/api/v1/) lives under
+ * `/api/v1/` and replaces the deprecated REST v2 endpoints (`/rest/v2/`).
+ */
+const TODOIST_API_BASE = 'https://api.todoist.com';
+
+/**
+ * Fetches all pages of a Todoist API v1 collection endpoint.
+ *
+ * Collection endpoints in the new API return a paginated envelope of the form
+ * `{ results: [...], next_cursor: "..." | null }`. This helper transparently
+ * follows the `next_cursor` until all items have been retrieved and returns a
+ * single concatenated array – mirroring the unpaginated behaviour of the old
+ * REST v2 endpoints, which is what the rest of the adapter expects.
+ *
+ * @param {string} relativeUrl  Path under {@link TODOIST_API_BASE}, e.g. `/api/v1/tasks`.
+ * @param {string} apiToken     Personal API token / OAuth bearer token.
+ * @param {Object} [params]     Additional query parameters (e.g. `{ query: '...' }`).
+ * @returns {Promise<Array>}    The combined `results` array across all pages.
+ */
+async function fetchAllPages(relativeUrl, apiToken, params) {
+    const collected = [];
+    let cursor = null;
+
+    do {
+        const queryParams = Object.assign({}, params || {});
+        if (cursor) {
+            queryParams.cursor = cursor;
+        }
+
+        const response = await axios({
+            method: 'get',
+            baseURL: TODOIST_API_BASE,
+            url: relativeUrl,
+            responseType: 'json',
+            headers: { Authorization: 'Bearer ' + apiToken },
+            params: queryParams
+        });
+
+        const data = response && response.data;
+
+        if (Array.isArray(data)) {
+            // Defensive: should not happen on v1, but tolerate it in case the
+            // server falls back to an unwrapped array response.
+            for (let i = 0; i < data.length; i++) collected.push(data[i]);
+            cursor = null;
+        } else if (data && Array.isArray(data.results)) {
+            for (let i = 0; i < data.results.length; i++) collected.push(data.results[i]);
+            // The wire format uses `next_cursor`; some clients/tests use
+            // `nextCursor`. Accept both to be safe.
+            cursor = (data.next_cursor !== undefined) ? data.next_cursor : data.nextCursor;
+            if (!cursor) cursor = null;
+        } else {
+            cursor = null;
+        }
+    } while (cursor);
+
+    return collected;
+}
 
 
 async function startAdapter(options) {
@@ -500,8 +562,8 @@ async function check_online(){
     
     await axios({
         method: 'get',
-        baseURL: 'https://api.todoist.com',
-        url: '/rest/v2/projects',
+        baseURL: TODOIST_API_BASE,
+        url: '/api/v1/projects',
         //responseType: 'json',
         headers: 
            { Authorization: 'Bearer ' + APItoken}
@@ -638,8 +700,8 @@ async function addTask(item, proejct_id, section_id, parent, order, label_id, pr
 
             await axios({
                 method: 'post',
-                baseURL: 'https://api.todoist.com',
-                url: '/rest/v2/tasks',
+                baseURL: TODOIST_API_BASE,
+                url: '/api/v1/tasks',
                 
                 headers: 
                 { 'Cache-Control': 'no-cache',
@@ -686,8 +748,8 @@ async function delTask(task_id){
         
 await axios({
     method: 'DELETE',
-    baseURL: 'https://api.todoist.com',
-    url: '/rest/v2/tasks/' + task_id,
+    baseURL: TODOIST_API_BASE,
+    url: '/api/v1/tasks/' + task_id,
     responseType: 'json',
     headers: 
     {  Authorization: 'Bearer ' + APItoken, },
@@ -728,8 +790,8 @@ async function addProject(project, parent){
 
 await axios({
     method: 'post',
-    baseURL: 'https://api.todoist.com',
-    url: '/rest/v2/projects',
+    baseURL: TODOIST_API_BASE,
+    url: '/api/v1/projects',
     responseType: 'json',
     headers: 
     { 'Cache-Control': 'no-cache',
@@ -774,8 +836,8 @@ async function dellProject(project_id){
   
     await axios({
         method: 'DELETE',
-        baseURL: 'https://api.todoist.com',
-        url: '/rest/v2/projects/' + project_id,
+        baseURL: TODOIST_API_BASE,
+        url: '/api/v1/projects/' + project_id,
         responseType: 'json',
         headers: 
         {  Authorization: 'Bearer ' + APItoken, },
@@ -814,8 +876,8 @@ async function closeTask(task_id){
     
     await axios({
         method: 'POST',
-        baseURL: 'https://api.todoist.com',
-        url: '/rest/v2/tasks/' + task_id + '/close',
+        baseURL: TODOIST_API_BASE,
+        url: '/api/v1/tasks/' + task_id + '/close',
         responseType: 'json',
         headers: 
         {  Authorization: 'Bearer ' + APItoken, },
@@ -856,8 +918,8 @@ async function reopenTask(task_id){
    
     await axios({
         method: 'POST',
-        baseURL: 'https://api.todoist.com',
-        url: '/rest/v2/tasks/' + task_id + '/reopen',
+        baseURL: TODOIST_API_BASE,
+        url: '/api/v1/tasks/' + task_id + '/reopen',
         responseType: 'json',
         headers: 
         {  Authorization: 'Bearer ' + APItoken, },
@@ -900,8 +962,8 @@ async function addSection(section, project_id){
        
 await axios({
     method: 'post',
-    baseURL: 'https://api.todoist.com',
-    url: '/rest/v2/sections',
+    baseURL: TODOIST_API_BASE,
+    url: '/api/v1/sections',
     responseType: 'json',
     headers: 
     { 'Cache-Control': 'no-cache',
@@ -948,8 +1010,8 @@ async function delSection(section_id){
 
 await axios({
     method: 'DELETE',
-    baseURL: 'https://api.todoist.com',
-    url: '/rest/v2/sections/' + section_id,
+    baseURL: TODOIST_API_BASE,
+    url: '/api/v1/sections/' + section_id,
     responseType: 'json',
     headers: 
     {  Authorization: 'Bearer ' + APItoken, },
@@ -997,45 +1059,26 @@ async function getData(){
                 if(debug) adapter.log.info("get Projects");
 
                 
-                await axios({
-                    method: 'get',
-                    baseURL: 'https://api.todoist.com',
-                    url: '/rest/v2/projects',
-                    responseType: 'json',
-                    headers: 
-                    { Authorization: 'Bearer ' + APItoken}
-                }    
-                ).then( 
-                    function (response) {
-                        //adapter.log.info('get Projects: ' + stringify(response, null, 2));
-                        var projects_json = response.data;
-                        all_project_objekts = projects_json;
-                    }
-                    
-                ).catch(
-
-                    function (error) {
-                        if (error.response) {
-                            // The request was made and the server responded with a status code
-                            adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-                            adapter.log.warn(JSON.stringify(error.toJSON()));
-                        } else if (error.request) {
-                            // The request was made but no response was received
-                            // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                            // http.ClientRequest in node.js
+                try {
+                    all_project_objekts = await fetchAllPages('/api/v1/projects', APItoken);
+                } catch (error) {
+                    if (error.response) {
+                        // The request was made and the server responded with a status code
+                        adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
+                        try { adapter.log.warn(JSON.stringify(error.toJSON())); } catch (e) { /* noop */ }
+                    } else if (error.request) {
+                        // The request was made but no response was received
                         adapter.log.info(error.message);
-                        } else {
-                            // Something happened in setting up the request that triggered an Error
-                            adapter.log.error(error.message); 
-                        }
-            }.bind(adapter)
-
-            ); 
+                    } else {
+                        // Something happened in setting up the request that triggered an Error
+                        adapter.log.error(error.message);
+                    }
+                }
 
 
 
     var project = { method: 'GET',
-          url: 'https://api.todoist.com/rest/v2/projects',
+          url: TODOIST_API_BASE + '/api/v1/projects',
           headers: 
            { Authorization: 'Bearer ' + APItoken}
     };
@@ -1059,39 +1102,18 @@ async function getData(){
             if(all_project_objekts[x].shared === true){
                 if(debug) adapter.log.info("get Collaborators");
                 
-                await axios({
-                    method: 'get',
-                    baseURL: 'https://api.todoist.com',
-                    url: '/rest/v2/projects/'+all_project_objekts[x].id +'/collaborators',
-                    responseType: 'json',
-                    headers: 
-                    { Authorization: 'Bearer ' + APItoken}
-                }    
-                ).then( 
-                    function (response) {
-                        //adapter.log.info('get Projects: ' + stringify(response, null, 2));
-                        collaborators = response.data;
-                    }
-                    
-                ).catch(
-
-                    function (error) {
-                        if (error.response) {
-                            // The request was made and the server responded with a status code
-                            adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-                            adapter.log.warn(JSON.stringify(error.toJSON()));
-                        } else if (error.request) {
-                            // The request was made but no response was received
-                            // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                            // http.ClientRequest in node.js
+                try {
+                    collaborators = await fetchAllPages('/api/v1/projects/' + all_project_objekts[x].id + '/collaborators', APItoken);
+                } catch (error) {
+                    if (error.response) {
+                        adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
+                        try { adapter.log.warn(JSON.stringify(error.toJSON())); } catch (e) { /* noop */ }
+                    } else if (error.request) {
                         adapter.log.info(error.message);
-                        } else {
-                            // Something happened in setting up the request that triggered an Error
-                            adapter.log.error(error.message); 
-                        }
-            }.bind(adapter)
-
-            ); 
+                    } else {
+                        adapter.log.error(error.message);
+                    }
+                }
             collaborators.unshift("project_id:"+all_project_objekts[x].id);
             //zu all collaborators Objekts hinzufügen
             all_collaborators_objects.push(collaborators)
@@ -1116,40 +1138,18 @@ async function getData(){
         if(debug) adapter.log.info("get Labels");
 
         
-        await axios({
-            method: 'get',
-            baseURL: 'https://api.todoist.com',
-            url: '/rest/v2/labels',
-            responseType: 'json',
-            headers: 
-            { Authorization: 'Bearer ' + APItoken}
-        }    
-        ).then( 
-            function (response) {
-                //adapter.log.info('get labels: ' + stringify(response, null, 2));
-                var labels_json = response.data;
-                all_label_objekts = labels_json;
+        try {
+            all_label_objekts = await fetchAllPages('/api/v1/labels', APItoken);
+        } catch (error) {
+            if (error.response) {
+                adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
+                try { adapter.log.warn(JSON.stringify(error.toJSON())); } catch (e) { /* noop */ }
+            } else if (error.request) {
+                adapter.log.info(error.message);
+            } else {
+                adapter.log.error(error.message);
             }
-            
-        ).catch(
-    
-            function (error) {
-                if (error.response) {
-                    // The request was made and the server responded with a status code
-                    adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-                    adapter.log.warn(JSON.stringify(error.toJSON()));
-                } else if (error.request) {
-                    // The request was made but no response was received
-                    // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                    // http.ClientRequest in node.js
-                   adapter.log.info(error.message);
-                } else {
-                    // Something happened in setting up the request that triggered an Error
-                    adapter.log.error(error.message); 
-                }
-    }.bind(adapter)
-    
-    ); 
+        }
  
     }
 
@@ -1158,40 +1158,18 @@ async function getData(){
 
         if(debug) adapter.log.info("get Sections");
             
-    await axios({
-        method: 'get',
-        baseURL: 'https://api.todoist.com',
-        url: '/rest/v2/sections',
-        responseType: 'json',
-        headers: 
-        { Authorization: 'Bearer ' + APItoken}
-    }    
-    ).then( 
-        function (response) {
-            //adapter.log.info('get sections: ' + stringify(response, null, 2));
-            var sections_json = response.data;
-            all_sections_objects = sections_json;
-        }
-        
-    ).catch(
-
-        function (error) {
+        try {
+            all_sections_objects = await fetchAllPages('/api/v1/sections', APItoken);
+        } catch (error) {
             if (error.response) {
-                // The request was made and the server responded with a status code
                 adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-                adapter.log.warn(JSON.stringify(error.toJSON()));
+                try { adapter.log.warn(JSON.stringify(error.toJSON())); } catch (e) { /* noop */ }
             } else if (error.request) {
-                // The request was made but no response was received
-                // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                // http.ClientRequest in node.js
-               adapter.log.info(error.message);
+                adapter.log.info(error.message);
             } else {
-                // Something happened in setting up the request that triggered an Error
-                adapter.log.error(error.message); 
+                adapter.log.error(error.message);
             }
-}.bind(adapter)
-
-); 
+        }
        
     }
 
@@ -1203,42 +1181,20 @@ async function getData(){
         
         
        
-    await axios({
-        method: 'get',
-        baseURL: 'https://api.todoist.com',
-        url: '/rest/v2/tasks',
-        responseType: 'json',
-        headers: 
-        { Authorization: 'Bearer ' + APItoken}
-    }    
-    ).then( 
-        function (response) {
-            //adapter.log.info('get Tasks: ' + stringify(response, null, 2));
-            if(debug)adapter.log.info("response is da");
-            var tasks_json = response.data;
-            all_task_objekts = tasks_json;
-            if(debug)adapter.log.info(JSON.stringify(all_task_objekts));
+    try {
+        if(debug) adapter.log.info("response is da");
+        all_task_objekts = await fetchAllPages('/api/v1/tasks', APItoken);
+        if(debug) adapter.log.info(JSON.stringify(all_task_objekts));
+    } catch (error) {
+        if (error.response) {
+            adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
+            try { adapter.log.warn(JSON.stringify(error.toJSON())); } catch (e) { /* noop */ }
+        } else if (error.request) {
+            adapter.log.info(error.message);
+        } else {
+            adapter.log.error(error.message);
         }
-        
-    ).catch(
-
-        function (error) {
-            if (error.response) {
-                // The request was made and the server responded with a status code
-                adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-                adapter.log.warn(JSON.stringify(error.toJSON()));
-            } else if (error.request) {
-                // The request was made but no response was received
-                // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                // http.ClientRequest in node.js
-               adapter.log.info(error.message);
-            } else {
-                // Something happened in setting up the request that triggered an Error
-                adapter.log.error(error.message); 
-            }
-}.bind(adapter)
-
-); 
+    }
         
 
 }
@@ -2878,47 +2834,27 @@ async function filterlist(){
 async function getDate_filter(filter_query){
 	
 	var APItoken = adapter.config.token;
-    
-await axios({
-    method: 'get',
-    baseURL: 'https://api.todoist.com',
-    url: '/rest/v2/tasks?filter=' + filter_query, 
-    responseType: 'json',
-    headers: 
-    { Authorization: 'Bearer ' + APItoken}
-}
-).then( 
-    function (response) {
-        if(debug)adapter.log.info('hole  Filter: ' + response);
-        if(typeof response === 'object' && response.status == 402){
-            adapter.log.warn("Todoist Api say you don't have a premium account. Pleasy bye one or deaktivate this feature!")
-        }else{
-        var filter_json = response.data;
-        
-         all_filter_objects = filter_json;
-            
+
+    try {
+        // The new Todoist API v1 exposes filter queries through a dedicated
+        // `tasks/filter` endpoint and uses the `query` query-parameter instead
+        // of the legacy v2 `?filter=...` syntax. The response is paginated.
+        all_filter_objects = await fetchAllPages('/api/v1/tasks/filter', APItoken, { query: filter_query });
+        if(debug) adapter.log.info('hole  Filter: ' + JSON.stringify(all_filter_objects));
+    } catch (error) {
+        if (error.response) {
+            if (error.response.status == 402) {
+                adapter.log.warn("Todoist Api say you don't have a premium account. Pleasy bye one or deaktivate this feature!");
+            } else {
+                adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
+                try { adapter.log.warn(JSON.stringify(error.toJSON())); } catch (e) { /* noop */ }
+            }
+        } else if (error.request) {
+            adapter.log.info(error.message);
+        } else {
+            adapter.log.error(error.message);
         }
     }
-    
-).catch(
-
-    function (error) {
-        if (error.response) {
-            // The request was made and the server responded with a status code
-            adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-            adapter.log.warn(JSON.stringify(error.toJSON()));
-        } else if (error.request) {
-            // The request was made but no response was received
-            // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-            // http.ClientRequest in node.js
-           adapter.log.info(error.message);
-        } else {
-            // Something happened in setting up the request that triggered an Error
-            adapter.log.error(error.message); 
-        }
-}.bind(adapter)
-
-);
 }
 
 
