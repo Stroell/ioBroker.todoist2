@@ -377,14 +377,15 @@ async function new_with_state(id, state){
     var new_label =  await adapter.getStateAsync('Control.New.Label');
 
 
-    // Wenn Felder leer sind diese auch löschen. Wir reassignen das ganze
-    // State-Objekt auf einen Default mit `val: ''`, damit der spätere Zugriff
-    // auf `.val` (z. B. in Debug-Logs oder beim Aufruf von addTask) nicht in
-    // einen TypeError läuft, wenn der State noch nie gesetzt wurde.
-    if (new_priority == null || new_priority.val === 0) { new_priority = { val: '' }; }
-    if (new_date == null || new_date.val === 0)         { new_date     = { val: '' }; }
-    if (new_label == null || new_label.val === 0)       { new_label    = { val: '' }; }
-    if (new_project == null || new_project.val === 0)   { new_project  = { val: '' }; }
+    // Wenn Felder leer sind diese auch löschen. Wir mutieren nur das `val`,
+    // damit etwaige weitere Eigenschaften des State-Objekts (ts, ack, from, …)
+    // erhalten bleiben. Falls der State noch nie gesetzt wurde, wird ein
+    // minimales Default-Objekt angelegt, damit der spätere Zugriff auf `.val`
+    // (in Debug-Logs und beim Aufruf von addTask) keinen TypeError wirft.
+    if (new_priority == null) { new_priority = { val: '' }; } else if (new_priority.val === 0) { new_priority.val = ''; }
+    if (new_date     == null) { new_date     = { val: '' }; } else if (new_date.val     === 0) { new_date.val     = ''; }
+    if (new_label    == null) { new_label    = { val: '' }; } else if (new_label.val    === 0) { new_label.val    = ''; }
+    if (new_project  == null) { new_project  = { val: '' }; } else if (new_project.val  === 0) { new_project.val  = ''; }
     //Debug ausgabe:
     if(debug) adapter.log.info("Anlage neues Todo mit Objekten");
     if(debug) adapter.log.info("Task: " + state.val);
