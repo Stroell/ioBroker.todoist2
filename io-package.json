@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "todoist2",
-    "version": "0.9.1",
+    "version": "0.9.2",
     "news": {
+      "0.9.2": {
+        "en": "Migrate adapter from Todoist REST v2 to API v1 with pagination support",
+        "de": "Migration des Adapters von Todoist REST v2 auf API v1 mit Paginierungsunterstützung",
+        "ru": "Перенос адаптера с Todoist REST v2 на API v1 с поддержкой постраничного вывода",
+        "pt": "Migrar o adaptador do Todoist REST v2 para a API v1 com suporte a paginação",
+        "nl": "Migratie van de adapter van Todoist REST v2 naar API v1 met paginering ondersteuning",
+        "fr": "Migration de l'adaptateur de Todoist REST v2 vers l'API v1 avec prise en charge de la pagination",
+        "it": "Migrazione dell'adattatore da Todoist REST v2 ad API v1 con supporto alla paginazione",
+        "es": "Migración del adaptador de Todoist REST v2 a la API v1 con soporte de paginación",
+        "pl": "Migracja adaptera z Todoist REST v2 do API v1 z obsługą paginacji",
+        "uk": "Міграція адаптера з Todoist REST v2 на API v1 з підтримкою пагінації",
+        "zh-cn": "将适配器从 Todoist REST v2 迁移到支持分页的 API v1"
+      },
       "0.9.1": {
         "en": "change to api v2",
         "de": "wechsel in api v2",
