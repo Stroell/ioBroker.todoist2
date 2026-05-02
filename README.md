@@ -166,6 +166,11 @@ Example for any image you like:
 ```
 
 ## Changelog
+### 0.9.2
+* (rde-master) Migrate adapter from Todoist REST v2 to API v1
+* (rde-master) Add pagination support for collection endpoints
+* (rde-master) Switch filter endpoint to /api/v1/tasks/filter
+
 ### 0.9.1
 * (rde-master) Bugfix description
 * (rde-master) Bugfix Translation
