@@ -1800,7 +1800,7 @@ async function tasktotask(){
         var id = JSON.stringify(json[i].id);
         content = content.replace(/\"/g, ''); //entfernt die Anfuehrungszeichen aus dem Quellstring
         //content = content[0].toUpperCase() + content.substring(1); // Macht den ersten Buchstaben des strings zu einem Grossbuchstaben
-        var taskurl = JSON.stringify(json[i].url);
+        var taskurl = JSON.stringify(json[i].url || '');
         taskurl = taskurl.replace(/\"/g, '');
         
         
