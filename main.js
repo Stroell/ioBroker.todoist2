@@ -58,6 +58,31 @@ let timeoutsyncron = null;
 // intervall:
 let mainintval = null;
 
+// Re-entrancy guard for main(). The polling interval can fire while a previous
+// run is still working through the API requests, which previously caused
+// overlapping `getStates()` / `delObject()` waves and unhandled rejections when
+// the second run raced with adapter shutdown.
+let mainRunning = false;
+
+// Global safety net: js-controller will terminate the adapter on an
+// unhandledRejection. Logging here keeps the instance alive (and gives us a
+// useful stack trace) when an async path forgets to attach a `.catch`.
+process.on('unhandledRejection', (reason) => {
+    try {
+        if (adapter && adapter.log && typeof adapter.log.error === 'function') {
+            const msg = (reason && (reason.stack || reason.message)) || String(reason);
+            adapter.log.error('unhandledRejection: ' + msg);
+        } else {
+            // adapter not yet available – fall back to stderr so the message
+            // still makes it into the iobroker host log
+            // eslint-disable-next-line no-console
+            console.error('unhandledRejection (no adapter):', reason);
+        }
+    } catch (e) {
+        // never let the handler itself crash the process
+    }
+});
+
 
 /**
  * Base URL of the Todoist API.
@@ -80,6 +105,55 @@ const TODOIST_API_BASE = 'https://api.todoist.com';
  * @param {Object} [params]     Additional query parameters (e.g. `{ query: '...' }`).
  * @returns {Promise<Array>}    The combined `results` array across all pages.
  */
+/**
+ * Wraps `adapter.setStateAsync` so that a transient error (e.g. DB closing
+ * during shutdown) is logged but does not propagate as an unhandled rejection.
+ */
+async function safeSetState(id, val, ack){
+    try {
+        await adapter.setStateAsync(id, val, ack);
+    } catch (err) {
+        if (adapter && adapter.log) {
+            adapter.log.debug('safeSetState(' + id + ') failed: ' + (err && err.message || err));
+        }
+    }
+}
+
+/**
+ * Callback-style wrapper around `adapter.getStates` that also catches the
+ * returned promise. `adapter.getStates(pattern, cb)` returns a promise even
+ * when a callback is supplied; if the states DB is closed (or the call races
+ * with shutdown) that promise rejects, and js-controller crashes the instance
+ * on the resulting unhandledRejection. Routing every call through this helper
+ * makes those rejections survivable.
+ */
+function safeGetStates(pattern, callback) {
+    const ret = adapter.getStates(pattern, callback);
+    if (ret && typeof ret.catch === 'function') {
+        ret.catch(err => {
+            if (adapter && adapter.log) {
+                adapter.log.warn('getStates(' + pattern + ') failed: ' + (err && err.message || err));
+            }
+        });
+    }
+}
+
+/**
+ * Callback-style wrapper around `adapter.delObject` that catches a rejected
+ * promise the same way `safeGetStates` does.
+ */
+function safeDelObject(id, callback) {
+    const ret = adapter.delObject(id, callback);
+    if (ret && typeof ret.catch === 'function') {
+        ret.catch(err => {
+            if (adapter && adapter.log) {
+                adapter.log.debug('delObject(' + id + ') failed: ' + (err && err.message || err));
+            }
+        });
+    }
+}
+
+
 async function fetchAllPages(relativeUrl, apiToken, params) {
     const collected = [];
     let cursor = null;
@@ -165,7 +239,7 @@ async function startAdapter(options) {
             if(blacklist[i].activ == true && blacklist[i].art == "section"){
 
                 if(debug) adapter.log.warn("Section found mit id: " + blacklist[i].id);
-                bl_projects.push(blacklist[i]);
+                bl_sections.push(blacklist[i]);
                 if(debug) adapter.log.info("bl Section" + bl_sections); 
 
             }
@@ -204,21 +278,31 @@ async function startAdapter(options) {
         }
     });
 
-    adapter.on('unload', (callback) => {
+    adapter.on('unload', async (callback) => {
         try {
             adapter.log.info('cleaned everything up...');
-                if (adapter && adapter.setState) adapter.setState('info.connection', false, true);
                 //adapter.log.info(JSON.stringify(mainintval));
                 mainintval && clearInterval(mainintval);
                 mainintval = null;
-                
-                
+
+                // Mark the adapter as disconnected, but await the call so it
+                // completes before js-controller closes the states DB. The old
+                // synchronous fire-and-forget call raced with shutdown and
+                // produced "DB closed" warnings.
+                if (adapter && typeof adapter.setStateAsync === 'function') {
+                    try {
+                        await adapter.setStateAsync('info.connection', false, true);
+                    } catch (e) {
+                        // ignore – DB may already be closed
+                    }
+                }
+
             callback();
         } catch (e) {
             callback();
         }
 
-        
+
     });
 
     
@@ -268,11 +352,13 @@ if(state.val == true && state.val !== undefined){
     for(var i = 0; i < all_task_objekts.length; i++){
         if(all_task_objekts[i].content == new_id){
             //adapter.log.info("task aus der liste gefunden " + JSON.stringify(state));
-            
+
             closeTask(all_task_objekts[i].id);
-            adapter.delObject("Tasks." + new_id, function (err) {
-                if (err) adapter.log.error('Cannot delete object: ' + err);
-            });
+            try {
+                await adapter.delObjectAsync("Tasks." + new_id);
+            } catch (err) {
+                adapter.log.error('Cannot delete object: ' + (err && err.message || err));
+            }
         }
     }
 }else if (state.val == true && state.val == undefined) {
@@ -289,13 +375,16 @@ async function new_with_state(id, state){
     var new_priority = await adapter.getStateAsync('Control.New.Priority');
     var new_date =  await adapter.getStateAsync('Control.New.Date');
     var new_label =  await adapter.getStateAsync('Control.New.Label');
-    
 
-    //wenn Felder leer sind dise auch löschen.
-    if(new_priority == null|| new_priority.val === 0){new_priority = ""};
-    if(new_date == null || new_date.val === 0){new_date = ""};
-    if(new_label == null || new_label.val === 0){new_label = ""};
-    if(new_project == null || new_project.val === 0){new_project = ""};
+
+    // Wenn Felder leer sind diese auch löschen. Wir reassignen das ganze
+    // State-Objekt auf einen Default mit `val: ''`, damit der spätere Zugriff
+    // auf `.val` (z. B. in Debug-Logs oder beim Aufruf von addTask) nicht in
+    // einen TypeError läuft, wenn der State noch nie gesetzt wurde.
+    if (new_priority == null || new_priority.val === 0) { new_priority = { val: '' }; }
+    if (new_date == null || new_date.val === 0)         { new_date     = { val: '' }; }
+    if (new_label == null || new_label.val === 0)       { new_label    = { val: '' }; }
+    if (new_project == null || new_project.val === 0)   { new_project  = { val: '' }; }
     //Debug ausgabe:
     if(debug) adapter.log.info("Anlage neues Todo mit Objekten");
     if(debug) adapter.log.info("Task: " + state.val);
@@ -557,62 +646,53 @@ function syncronisation(){
 
 
 async function check_online(){
-    var APItoken = adapter.config.token;    
+    var APItoken = adapter.config.token;
 
-    
-    await axios({
-        method: 'get',
-        baseURL: TODOIST_API_BASE,
-        url: '/api/v1/projects',
-        //responseType: 'json',
-        headers: 
-           { Authorization: 'Bearer ' + APItoken}
-    }).then(
-        function (response) {
 
-            //adapter.log.warn("axios check!! " + stringify(response, null, 2));
-            //adapter.log.warn("axios check!! " + response.status);
+    try {
+        const response = await axios({
+            method: 'get',
+            baseURL: TODOIST_API_BASE,
+            url: '/api/v1/projects',
+            //responseType: 'json',
+            headers:
+               { Authorization: 'Bearer ' + APItoken}
+        });
 
-            if(typeof response === 'object' && response.status == 200){
-            	if(debug) adapter.log.warn("check online: " + JSON.stringify(response.status));
-                adapter.setState('info.connection', true, true);
-                online_net = true;
-                
-                
-            }else{
-            	
-            	adapter.setState('info.connection', false, true);
-                adapter.log.warn("No Connection to todoist possible!!! Please Check your Internet Connection.")
-                online_net = false;
-                
-            }
+        //adapter.log.warn("axios check!! " + stringify(response, null, 2));
+        //adapter.log.warn("axios check!! " + response.status);
+
+        if(typeof response === 'object' && response.status == 200){
+            if(debug) adapter.log.warn("check online: " + JSON.stringify(response.status));
+            await safeSetState('info.connection', true, true);
+            online_net = true;
+        }else{
+            await safeSetState('info.connection', false, true);
+            adapter.log.warn("No Connection to todoist possible!!! Please Check your Internet Connection.");
+            online_net = false;
         }
-        
-        ).catch(
+    } catch (error) {
+        if (error.response) {
+            // The request was made and the server responded with a status code
+            adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
+            await safeSetState('info.connection', false, true);
+            online_net = false;
+        } else if (error.request) {
+            // The request was made but no response was received
+            // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
+            // http.ClientRequest in node.js
+            adapter.log.info(error.message);
+            await safeSetState('info.connection', false, true);
+            online_net = false;
 
-            function (error) {
-                if (error.response) {
-                    // The request was made and the server responded with a status code
-                    adapter.log.warn('received error ' + error.response.status + ' response from todoist with content: ' + JSON.stringify(error.response.data));
-                    adapter.setState('info.connection', false, true);
-                    online_net = false;
-                } else if (error.request) {
-                    // The request was made but no response was received
-                    // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                    // http.ClientRequest in node.js
-                    adapter.log.info(error.message);
-                    adapter.setState('info.connection', false, true);
-                    online_net = false;
+        } else {
+            // Something happened in setting up the request that triggered an Error
+            adapter.log.error(error.message);
+            await safeSetState('info.connection', false, true);
+            online_net = false;
 
-                } else {
-                    // Something happened in setting up the request that triggered an Error
-                    adapter.log.error(error.message);
-                    adapter.setState('info.connection', false, true);
-                    online_net = false;
-  
-                }
-            }.bind(adapter)
- );
+        }
+    }
 }
 
 
@@ -672,10 +752,13 @@ async function addTask(item, proejct_id, section_id, parent, order, label_id, pr
           var datasend = {content: item };
           
           if(proejct_id != "" && proejct_id != null){
-            datasend.project_id = parseInt(proejct_id);
-            };            
+            // Todoist API v1 returns IDs as strings that may exceed
+            // Number.MAX_SAFE_INTEGER. Send the raw string to avoid silent
+            // precision loss from parseInt.
+            datasend.project_id = String(proejct_id);
+            };
             if(section_id != "" && section_id != null){
-            datasend.section_id= parseInt(section_id);
+            datasend.section_id= String(section_id);
             };
             if(parent != "" && parent != null){
             datasend.parent=parent;
@@ -1311,7 +1394,10 @@ async function getProject(){
             var projects_json = all_project_objekts; // Alle Projekte in die globelae Variable lesen
            
             for (k = 0; k < projects_json.length; k++) {
-                var projects = parseInt(projects_json[k].id);
+                // Todoist API v1 returns IDs as strings; preserve them as
+                // strings to avoid precision loss for IDs larger than
+                // Number.MAX_SAFE_INTEGER.
+                var projects = String(projects_json[k].id);
                 var is_blacklist = false;
                 for (var w = 0; w < bl_projects.length; w++){               
                     if(projects == bl_projects[w].id){
@@ -1434,8 +1520,10 @@ async function getLabels(){
             var labels_json = all_label_objekts;  //Labels in globale Variable lesen
 
             for (i = 0; i < labels_json.length; i++) {
-                
-                var labels1 = parseInt(labels_json[i].id);
+
+                // Todoist API v1 returns IDs as strings; keep them as strings
+                // to avoid precision loss.
+                var labels1 = String(labels_json[i].id);
                 
                 var is_blacklist = false;
                 for (var w = 0; w < bl_labels.length; w++){               
@@ -1582,8 +1670,9 @@ async function getSections(){
             if (sections_json.length > 0){
             
             for (i = 0; i < sections_json.length; i++) {
-                
-                var sections1 = parseInt(sections_json[i].id);
+
+                // Todoist API v1 returns IDs as strings; keep them as strings.
+                var sections1 = String(sections_json[i].id);
 
                 var is_blacklist = false;
                 for (var w = 0; w < bl_sections.length; w++){               
@@ -1671,8 +1760,9 @@ async function tasktotask(){
 
     //Schleife für Objekte unter Tasks:
     for (i = 0; i < json.length; i++) {
-                        
-        var Liste = parseInt(json[i].project_id);
+
+        // Todoist API v1: project_id is a string; preserve it as such.
+        var Liste = String(json[i].project_id);
 
         var is_blacklist = false;
         for (var w = 0; w < bl_projects.length; w++){               
@@ -1803,7 +1893,8 @@ async function tasktoproject(project){
 
         for (i = 0; i < json.length; i++) {
 
-            var Liste = parseInt(json[i].project_id);
+            // Todoist API v1: project_id is a string; preserve it as such.
+            var Liste = String(json[i].project_id);
             var content = JSON.stringify(json[i].content);
 
             content = content.replace(/\"/g, ''); //entfernt die Anfuehrungszeichen aus dem Quellstring
@@ -2194,7 +2285,7 @@ var end_pos;
 var match = false;
 // Tasks:
 if (adapter.config.tasks == true){
-    adapter.getStates('Tasks.*', function (err, states) {
+    safeGetStates('Tasks.*', function (err, states) {
        if (debug) adapter.log.info("...........Jetzt Tasks prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) {        
             //Aus der ID den Namen extrahieren:
@@ -2244,7 +2335,7 @@ if (adapter.config.tasks == true){
             if (match != true){
 
                 adapter.log.info("dieser state löschen: " + new_id);
-                adapter.delObject("Tasks." + new_id, function (err) {
+                safeDelObject("Tasks." + new_id, function (err) {
 
                                if (err) adapter.log.error('Cannot delete object: ' + err);
 
@@ -2260,7 +2351,7 @@ if (adapter.config.tasks == true){
 
  //Projekte HTML
 if (adapter.config.project == true && adapter.config.html_objects == true){
-    adapter.getStates('HTML.Projects-HTML.*', function (err, states) {
+    safeGetStates('HTML.Projects-HTML.*', function (err, states) {
       if (debug)  adapter.log.info("...........Jetzt Projekte HTML prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) {    
 
@@ -2304,7 +2395,7 @@ if (adapter.config.project == true && adapter.config.html_objects == true){
              if (match != true){
  
                  adapter.log.info("dieser state löschen: " + new_id);
-                 adapter.delObject("HTML.Projects-HTML." + new_id, function (err) {
+                 safeDelObject("HTML.Projects-HTML." + new_id, function (err) {
  
                                  if (err) adapter.log.error('Cannot delete object: ' + err);
  
@@ -2319,7 +2410,7 @@ if (adapter.config.project == true && adapter.config.html_objects == true){
 }
     //Projekte JSON
     if (adapter.config.project == true && adapter.config.json_objects == true){
-    adapter.getStates('JSON.Projects-JSON.*', function (err, states) {
+    safeGetStates('JSON.Projects-JSON.*', function (err, states) {
        if (debug) adapter.log.info("...........Jetzt Projekte JSON prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) {    
 
@@ -2363,7 +2454,7 @@ if (adapter.config.project == true && adapter.config.html_objects == true){
              if (match != true){
  
                  adapter.log.info("dieser state löschen: " + new_id);
-                 adapter.delObject("JSON.Projects-JSON." + new_id, function (err) {
+                 safeDelObject("JSON.Projects-JSON." + new_id, function (err) {
  
                                  if (err) adapter.log.error('Cannot delete object: ' + err);
  
@@ -2379,7 +2470,7 @@ if (adapter.config.project == true && adapter.config.html_objects == true){
 
 //Projekte TEXT
 if (adapter.config.project == true && adapter.config.text_objects == true){
-    adapter.getStates('TEXT.Projects-TEXT.*', function (err, states) {
+    safeGetStates('TEXT.Projects-TEXT.*', function (err, states) {
        if (debug) adapter.log.info("...........Jetzt Projekte TEXT prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) {    
 
@@ -2423,7 +2514,7 @@ if (adapter.config.project == true && adapter.config.text_objects == true){
              if (match != true){
  
                  adapter.log.info("Projekte Text dieser state löschen: " + new_id);
-                 adapter.delObject("TEXT.Projects-TEXT." + new_id, function (err) {
+                 safeDelObject("TEXT.Projects-TEXT." + new_id, function (err) {
  
                                  if (err) adapter.log.error('Cannot delete object: ' + err);
  
@@ -2444,7 +2535,7 @@ if (adapter.config.project == true && adapter.config.text_objects == true){
 
 //Labels HTML
 if (adapter.config.labels == true && adapter.config.html_objects == true){
-adapter.getStates('HTML.Labels-HTML.*', function (err, states) {
+safeGetStates('HTML.Labels-HTML.*', function (err, states) {
     if (debug) adapter.log.info("...........Jetzt Labels HTML prüfen ob etwas gelöscht werden soll..............");
     for (var id in states) {    
 
@@ -2495,7 +2586,7 @@ adapter.getStates('HTML.Labels-HTML.*', function (err, states) {
          if (match != true){
 
              adapter.log.info("labels html dieser state löschen: " + new_id);
-             adapter.delObject("HTML.Labels-HTML." + new_id, function (err) {
+             safeDelObject("HTML.Labels-HTML." + new_id, function (err) {
 
                              if (err) adapter.log.error('Cannot delete object: ' + err);
 
@@ -2510,7 +2601,7 @@ adapter.getStates('HTML.Labels-HTML.*', function (err, states) {
 }
 //Labels JSON
 if (adapter.config.labels == true && adapter.config.json_objects == true){
-adapter.getStates('JSON.Labels-JSON.*', function (err, states) {
+safeGetStates('JSON.Labels-JSON.*', function (err, states) {
     if(debug) adapter.log.info("...........Jetzt Labels JSON prüfen ob etwas gelöscht werden soll..............");
     for (var id in states) {    
 
@@ -2553,7 +2644,7 @@ adapter.getStates('JSON.Labels-JSON.*', function (err, states) {
          if (match != true){
 
              adapter.log.info("json html dieser state löschen: " + new_id);
-             adapter.delObject("JSON.Labels-JSON." + new_id, function (err) {
+             safeDelObject("JSON.Labels-JSON." + new_id, function (err) {
 
                              if (err) adapter.log.error('Cannot delete object: ' + err);
 
@@ -2569,7 +2660,7 @@ adapter.getStates('JSON.Labels-JSON.*', function (err, states) {
 
 //Labels TEXT
 if (adapter.config.labels == true && adapter.config.text_objects == true){
-    adapter.getStates('TEXT.Labels-TEXT.*', function (err, states) {
+    safeGetStates('TEXT.Labels-TEXT.*', function (err, states) {
         if(debug) adapter.log.info("...........Jetzt Labels Text prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) {    
     
@@ -2612,7 +2703,7 @@ if (adapter.config.labels == true && adapter.config.text_objects == true){
              if (match != true){
     
                  adapter.log.info("Text Labels dieser state löschen: " + new_id);
-                 adapter.delObject("TEXT.Labels-TEXT." + new_id, function (err) {
+                 safeDelObject("TEXT.Labels-TEXT." + new_id, function (err) {
     
                                  if (err) adapter.log.error('Cannot delete object: ' + err);
     
@@ -2629,7 +2720,7 @@ if (adapter.config.labels == true && adapter.config.text_objects == true){
 
 // Filter HTML
 if(adapter.config.html_objects == true){
-    adapter.getStates('HTML.Filter-HTML.*', function (err, states) {
+    safeGetStates('HTML.Filter-HTML.*', function (err, states) {
         if(debug) adapter.log.info("...........Jetzt Filter HTML prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) { 
 
@@ -2651,7 +2742,7 @@ if(adapter.config.html_objects == true){
             if (match != true){
     
                 adapter.log.info("Filter Html löschen: " + new_id);
-                adapter.delObject("HTML.Filter-HTML." + new_id, function (err) {
+                safeDelObject("HTML.Filter-HTML." + new_id, function (err) {
    
                                 if (err) adapter.log.error('Cannot delete object: ' + err);
    
@@ -2671,7 +2762,7 @@ if(adapter.config.html_objects == true){
 
 // Filter JSON
 if(adapter.config.html_objects == true){
-    adapter.getStates('JSON.Filter-JSON.*', function (err, states) {
+    safeGetStates('JSON.Filter-JSON.*', function (err, states) {
         if(debug) adapter.log.info("...........Jetzt Filter JSON prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) { 
 
@@ -2693,7 +2784,7 @@ if(adapter.config.html_objects == true){
             if (match != true){
     
                 adapter.log.info("Filter JSON löschen: " + new_id);
-                adapter.delObject("JSON.Filter-JSON." + new_id, function (err) {
+                safeDelObject("JSON.Filter-JSON." + new_id, function (err) {
    
                                 if (err) adapter.log.error('Cannot delete object: ' + err);
    
@@ -2713,7 +2804,7 @@ if(adapter.config.html_objects == true){
 
 // Filter TEXT
 if(adapter.config.html_objects == true){
-    adapter.getStates('TEXT.Filter-TEXT.*', function (err, states) {
+    safeGetStates('TEXT.Filter-TEXT.*', function (err, states) {
         if(debug) adapter.log.info("...........Jetzt Filter TEXT prüfen ob etwas gelöscht werden soll..............");
         for (var id in states) { 
 
@@ -2735,7 +2826,7 @@ if(adapter.config.html_objects == true){
             if (match != true){
     
                 adapter.log.info("Filter TEXT löschen: " + new_id);
-                adapter.delObject("TEXT.Filter-TEXT." + new_id, function (err) {
+                safeDelObject("TEXT.Filter-TEXT." + new_id, function (err) {
    
                                 if (err) adapter.log.error('Cannot delete object: ' + err);
    
@@ -2864,104 +2955,122 @@ async function main() {
         return;
     }
 
-
-    // Check Verbindung
-    // wenn false, dann beenden.
-    // es erfolgt dann auch kein neuer check mehr, adapter muss dann wohl erst neu gestatet werden??
-   var status = await check_online();
-
-
-
-       if (online_net == false){
-        /*
-        rechnen = rechnen * 2;
-        clearTimeout(mainintval);
-        mainintval = setTimeout(function(){
-            main();
-        }, rechnen);
-        */
-        online_count ++;
-        if(online_count > 10){
-            clearInterval(mainintval);
-            adapter.log.error("Adapter cant't finde the API. You need to restart the Adapter to try again!!!!")   ;       
-        }
-        adapter.log.warn("Check again in " + poll + " seconds!");
-        var x = 10 - online_count;
-        adapter.log.warn("Checks before you need to restatd the Adapter: " + x);
-        return
-        
-    };
-
-    //ist online, deshalb count auf 0 stellen:
-    if(online_count > 0){
-        online_count = 0;
-        adapter.log.info("Adapter is online, Checks before restart reset!");
-
+    // Re-entrancy guard: setInterval(main, poll) can fire while a previous
+    // run is still inside `getData()` or `remove_old_objects()`. Overlapping
+    // runs flooded the controller with `getStates` calls, and any of them
+    // racing with shutdown produced unhandled rejections from
+    // `_processStatesSecondary`.
+    if (mainRunning) {
+        if (debug) adapter.log.info('main() already running, skipping this poll cycle');
+        return;
     }
-  
-    
+    mainRunning = true;
 
-    poll = adapter.config.pollingInterval;
-    
-    if (debug) adapter.log.warn("Debug Mode for todoist is online: Many Logs are generated!");
-    //if (debug) adapter.log.info("Token: " + adapter.config.token);
-	if (debug) adapter.log.info("Polling: " + adapter.config.pollingInterval);
-    if (debug) adapter.log.info("Debug mode: " + adapter.config.debug);
-    if (debug) adapter.log.warn("Dublikate Modus: " + adapter.config.dublicate);
-   
-    // lese die daten ein:
-    status = await getData();
-
-    // wenn daten da sind weiter:
-    if(adapter.config.raw_data === true){
-        var raw_data =  await getRAW();
-        
-    }
+    try {
+        // Check Verbindung
+        // wenn false, dann beenden.
+        // es erfolgt dann auch kein neuer check mehr, adapter muss dann wohl erst neu gestatet werden??
+       var status = await check_online();
 
 
-        if(adapter.config.project === true){
-            var projects =  await getProject();
-            if (typeof projects !== "undefined") {
-            tasktoproject(projects);
-            }	
-        }
-        
-        if(adapter.config.section === true){
-            var sections =  await getSections();	
-                
-        }
 
-        if(adapter.config.labels === true){
-            var labels =  await getLabels();
-            if (typeof labels !== "undefined") {
-            tasktolabels(labels);	         
+           if (online_net == false){
+            /*
+            rechnen = rechnen * 2;
+            clearTimeout(mainintval);
+            mainintval = setTimeout(function(){
+                main();
+            }, rechnen);
+            */
+            online_count ++;
+            if(online_count > 10){
+                clearInterval(mainintval);
+                adapter.log.error("Adapter cant't finde the API. You need to restart the Adapter to try again!!!!")   ;
             }
+            adapter.log.warn("Check again in " + poll + " seconds!");
+            var x = 10 - online_count;
+            adapter.log.warn("Checks before you need to restatd the Adapter: " + x);
+            return;
+
+        };
+
+        //ist online, deshalb count auf 0 stellen:
+        if(online_count > 0){
+            online_count = 0;
+            adapter.log.info("Adapter is online, Checks before restart reset!");
+
         }
-        
-        if(adapter.config.tasks === true){
 
-            tasktotask();
+
+
+        poll = adapter.config.pollingInterval;
+
+        if (debug) adapter.log.warn("Debug Mode for todoist is online: Many Logs are generated!");
+        //if (debug) adapter.log.info("Token: " + adapter.config.token);
+    	if (debug) adapter.log.info("Polling: " + adapter.config.pollingInterval);
+        if (debug) adapter.log.info("Debug mode: " + adapter.config.debug);
+        if (debug) adapter.log.warn("Dublikate Modus: " + adapter.config.dublicate);
+
+        // lese die daten ein:
+        status = await getData();
+
+        // wenn daten da sind weiter:
+        if(adapter.config.raw_data === true){
+            var raw_data =  await getRAW();
 
         }
 
-     
-        syncronisation();
-    
 
-    if (adapter.config.rm_old_objects == true){
+            if(adapter.config.project === true){
+                var projects =  await getProject();
+                if (typeof projects !== "undefined") {
+                await tasktoproject(projects);
+                }
+            }
 
-        remove_old_objects();
+            if(adapter.config.section === true){
+                var sections =  await getSections();
 
+            }
+
+            if(adapter.config.labels === true){
+                var labels =  await getLabels();
+                if (typeof labels !== "undefined") {
+                await tasktolabels(labels);
+                }
+            }
+
+            if(adapter.config.tasks === true){
+
+                await tasktotask();
+
+            }
+
+
+            syncronisation();
+
+
+        if (adapter.config.rm_old_objects == true){
+
+            // Awaiting prevents the next polling cycle from starting before
+            // the (potentially long) cleanup completes.
+            await remove_old_objects();
+
+        }
+
+        if (adapter.config.filter_aktiv == true){
+
+            await filterlist();
+
+        }
+    } catch (err) {
+        adapter.log.error('main() failed: ' + (err && err.stack || err));
+    } finally {
+        mainRunning = false;
     }
-    
-    if (adapter.config.filter_aktiv == true){
-    
-        filterlist();
 
-    }
-    
 
-    
+
 
 //wenn fertig  funktion nach ablauf poll neu starten:
 //mainintval =  (function(){main();}, 60000);
